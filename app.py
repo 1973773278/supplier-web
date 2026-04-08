@@ -2,7 +2,7 @@ import os
 import io
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pandas as pd
 import streamlit as st
@@ -10,11 +10,12 @@ import streamlit as st
 # ========= 基础路径 =========
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
-UPLOAD_FILE = os.path.join(DATA_DIR, "current.xlsx")
-META_FILE = os.path.join(DATA_DIR, "meta.json")
+ARCHIVE_DIR = os.path.join(DATA_DIR, "archive")
 PASSWORD_FILE = os.path.join(DATA_DIR, "passwords.json")
+INDEX_FILE = os.path.join(DATA_DIR, "archive_index.json")
 
 os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(ARCHIVE_DIR, exist_ok=True)
 
 st.set_page_config(page_title="供应商数据下载", layout="wide")
 
@@ -33,6 +34,7 @@ def extract_date_from_filename(filename: str) -> str:
     """
     从文件名里提取日期：
     支持 20260407 / 2026-04-07 / 2026_04_07
+    返回 YYYYMMDD
     """
     if not filename:
         return datetime.now().strftime("%Y%m%d")
@@ -51,10 +53,6 @@ def extract_date_from_filename(filename: str) -> str:
 
 
 def get_admin_password() -> str:
-    """
-    优先从 st.secrets 读管理员密码。
-    如果你没配 secrets.toml，就先用默认密码 admin123。
-    """
     try:
         return st.secrets["ADMIN_PASSWORD"]
     except Exception:
@@ -73,23 +71,117 @@ def save_passwords(data: dict):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+def load_index() -> list:
+    if os.path.exists(INDEX_FILE):
+        with open(INDEX_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                return data
+    return []
+
+
+def save_index(data: list):
+    with open(INDEX_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def normalize_date_display(yyyymmdd: str) -> str:
+    if len(yyyymmdd) == 8 and yyyymmdd.isdigit():
+        return f"{yyyymmdd[:4]}-{yyyymmdd[4:6]}-{yyyymmdd[6:8]}"
+    return yyyymmdd
+
+
+def cleanup_old_files(retention_days: int = 30):
+    """
+    清理超出保留天数的历史文件。
+    依据 source_date 判断是否过期。
+    """
+    records = load_index()
+    today = datetime.now().date()
+    kept = []
+
+    for rec in records:
+        source_date = rec.get("source_date", "")
+        file_path = rec.get("file_path", "")
+
+        keep_this = True
+        try:
+            file_date = datetime.strptime(source_date, "%Y%m%d").date()
+            if (today - file_date).days > retention_days:
+                keep_this = False
+        except Exception:
+            pass
+
+        if keep_this and os.path.exists(file_path):
+            kept.append(rec)
+        else:
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except Exception:
+                    pass
+
+    save_index(kept)
+
+
 def save_uploaded_file(uploaded_file):
-    with open(UPLOAD_FILE, "wb") as f:
+    """
+    按文件名日期保存：
+    例如 20260407_出库计划-20260407.xlsx
+    同一天重复上传时，覆盖当天文件记录
+    """
+    cleanup_old_files(retention_days=30)
+
+    source_name = uploaded_file.name
+    source_date = extract_date_from_filename(source_name)
+    saved_name = f"{source_date}_{safe_filename(source_name)}"
+    file_path = os.path.join(ARCHIVE_DIR, saved_name)
+
+    with open(file_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
-    meta = {
-        "source_name": uploaded_file.name,
-        "upload_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }
-    with open(META_FILE, "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
+    records = load_index()
+
+    # 如果同一天已有记录，先删掉旧文件和旧记录
+    new_records = []
+    for rec in records:
+        if rec.get("source_date") == source_date:
+            old_path = rec.get("file_path", "")
+            if os.path.exists(old_path):
+                try:
+                    os.remove(old_path)
+                except Exception:
+                    pass
+        else:
+            if os.path.exists(rec.get("file_path", "")):
+                new_records.append(rec)
+
+    new_records.append({
+        "source_name": source_name,
+        "source_date": source_date,
+        "upload_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "file_path": file_path
+    })
+
+    # 按日期倒序
+    new_records.sort(key=lambda x: x.get("source_date", ""), reverse=True)
+    save_index(new_records)
 
 
-def load_meta() -> dict:
-    if os.path.exists(META_FILE):
-        with open(META_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+def get_archive_records() -> list:
+    cleanup_old_files(retention_days=30)
+    records = load_index()
+    valid_records = [x for x in records if os.path.exists(x.get("file_path", ""))]
+    valid_records.sort(key=lambda x: x.get("source_date", ""), reverse=True)
+    return valid_records
+
+
+def get_record_by_date(source_date: str):
+    records = get_archive_records()
+    for rec in records:
+        if rec.get("source_date") == source_date:
+            return rec
+    return None
 
 
 def find_transport_column(df: pd.DataFrame):
@@ -107,16 +199,18 @@ def find_transport_column(df: pd.DataFrame):
     raise ValueError("找不到“运输”列，也没有 AN 列可用。")
 
 
-def load_current_df():
-    if not os.path.exists(UPLOAD_FILE):
-        return None, None, None
+def load_df_from_record(record):
+    if not record:
+        return None, None
 
-    df = pd.read_excel(UPLOAD_FILE, dtype=str)
+    file_path = record.get("file_path", "")
+    if not os.path.exists(file_path):
+        return None, None
+
+    df = pd.read_excel(file_path, dtype=str)
     df = df.fillna("")
-
     transport_col = find_transport_column(df)
-    meta = load_meta()
-    return df, transport_col, meta
+    return df, transport_col
 
 
 def get_supplier_list(df: pd.DataFrame, transport_col):
@@ -136,16 +230,17 @@ def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
 
 # ========= 页面标题 =========
 st.title("供应商数据下载网页")
-st.caption("管理员上传总表后，供应商可按供应商名称 + 密码查看并下载自己的数据。")
+st.caption("管理员上传总表后，系统按文件名日期归档；供应商可输入名称、密码，并按日期查看和下载自己的数据。")
 
 
-# ========= 侧边栏：说明 =========
+# ========= 侧边栏 =========
 with st.sidebar:
     st.header("使用说明")
-    st.write("1. 管理员先上传当天总表")
-    st.write("2. 给供应商设置密码")
-    st.write("3. 供应商手动输入自己的供应商名称")
-    st.write("4. 输入密码后查看并下载自己的 Excel")
+    st.write("1. 管理员上传当天总表")
+    st.write("2. 系统按文件名日期归档")
+    st.write("3. 默认保留最近 30 天")
+    st.write("4. 供应商输入自己的供应商名称和密码")
+    st.write("5. 再按日期查看和下载自己的数据")
     st.info("如果你没配置 secrets.toml，管理员默认密码是：admin123")
 
 
@@ -177,66 +272,79 @@ with tab_admin:
         uploaded = st.file_uploader("请选择 Excel 文件", type=["xlsx", "xlsm"])
 
         if uploaded is not None:
+            source_date = extract_date_from_filename(uploaded.name)
             st.write(f"已选择文件：{uploaded.name}")
-            if st.button("保存为当前总表"):
+            st.write(f"识别到日期：{normalize_date_display(source_date)}")
+            st.write("说明：如果该日期已存在旧文件，上传后会覆盖该日期的旧版本。")
+
+            if st.button("保存并归档"):
                 save_uploaded_file(uploaded)
-                st.success("总表已保存，供应商现在可以查看最新数据了。")
+                st.success("文件已归档成功。")
 
         st.markdown("---")
         st.subheader("2）设置供应商密码")
 
-        try:
-            df, transport_col, meta = load_current_df()
-        except Exception as e:
-            df, transport_col, meta = None, None, None
-            st.error(f"读取当前总表失败：{e}")
+        records = get_archive_records()
+        latest_record = records[0] if records else None
 
-        if df is not None:
-            suppliers = get_supplier_list(df, transport_col)
-            passwords = load_passwords()
+        if latest_record:
+            try:
+                df, transport_col = load_df_from_record(latest_record)
+                passwords = load_passwords()
 
-            st.write(f"当前总表来源：{meta.get('source_name', '未知文件')}")
-            st.write(f"上传时间：{meta.get('upload_time', '未知时间')}")
-            st.write(f"识别到供应商数量：{len(suppliers)}")
+                suppliers = get_supplier_list(df, transport_col)
 
-            selected_for_pwd = st.selectbox("选择要设置密码的供应商", suppliers)
+                st.write(f"当前最新日期：{normalize_date_display(latest_record.get('source_date', ''))}")
+                st.write(f"最新文件：{latest_record.get('source_name', '未知文件')}")
+                st.write(f"识别到供应商数量：{len(suppliers)}")
 
-            new_password = st.text_input("输入该供应商的新密码", type="password", key="new_supplier_password")
+                selected_for_pwd = st.selectbox("选择要设置密码的供应商", suppliers)
+                new_password = st.text_input("输入该供应商的新密码", type="password", key="new_supplier_password")
 
-            if st.button("保存这个供应商的密码"):
-                if not new_password.strip():
-                    st.warning("密码不能为空")
+                if st.button("保存这个供应商的密码"):
+                    if not new_password.strip():
+                        st.warning("密码不能为空")
+                    else:
+                        passwords[selected_for_pwd] = new_password.strip()
+                        save_passwords(passwords)
+                        st.success(f"已保存：{selected_for_pwd}")
+
+                st.markdown("**已设置密码的供应商**")
+                names = list(passwords.keys())
+                if names:
+                    st.write("、".join(names))
                 else:
-                    passwords[selected_for_pwd] = new_password.strip()
-                    save_passwords(passwords)
-                    st.success(f"已保存：{selected_for_pwd}")
+                    st.write("还没有设置任何供应商密码。")
 
-            st.markdown("**已设置密码的供应商**")
-            names = list(passwords.keys())
-            if names:
-                st.write("、".join(names))
-            else:
-                st.write("还没有设置任何供应商密码。")
+            except Exception as e:
+                st.error(f"读取最新归档文件失败：{e}")
         else:
-            st.info("请先上传总表，再设置供应商密码。")
+            st.info("请先上传至少一份总表。")
+
+        st.markdown("---")
+        st.subheader("3）已归档日期")
+
+        records = get_archive_records()
+        if records:
+            for rec in records:
+                st.write(
+                    f"日期：{normalize_date_display(rec.get('source_date', ''))} | "
+                    f"文件：{rec.get('source_name', '')} | "
+                    f"上传时间：{rec.get('upload_time', '')}"
+                )
+        else:
+            st.write("当前没有归档文件。")
 
 
 # ========= 供应商下载区 =========
 with tab_supplier:
     st.subheader("供应商登录并下载")
 
-    try:
-        df, transport_col, meta = load_current_df()
-    except Exception as e:
-        df, transport_col, meta = None, None, None
-        st.error(f"读取当前总表失败：{e}")
+    records = get_archive_records()
 
-    if df is None:
-        st.warning("管理员还没有上传总表。")
+    if not records:
+        st.warning("管理员还没有上传任何总表。")
     else:
-        st.write(f"当前总表：{meta.get('source_name', '未知文件')}")
-        st.write(f"更新时间：{meta.get('upload_time', '未知时间')}")
-
         passwords = load_passwords()
 
         if "viewer_ok" not in st.session_state:
@@ -251,12 +359,12 @@ with tab_supplier:
             st.session_state.viewer_ok = False
             st.session_state.viewer_supplier = input_supplier
 
-        if st.button("查看我的数据"):
+        if st.button("验证身份"):
             if not input_supplier:
                 st.error("请输入供应商名称。")
                 st.session_state.viewer_ok = False
             else:
-                real_pwd = passwords.get(input_supplier, None)
+                real_pwd = passwords.get(input_supplier)
 
                 if real_pwd is None:
                     st.error("供应商名称不存在，或管理员还没有为该供应商设置密码。")
@@ -265,26 +373,45 @@ with tab_supplier:
                     st.error("密码错误。")
                     st.session_state.viewer_ok = False
                 else:
-                    supplier_df = df[df[transport_col].astype(str).str.strip() == input_supplier].copy()
-                    if supplier_df.empty:
-                        st.error("当前总表中没有找到该供应商的数据。")
-                        st.session_state.viewer_ok = False
-                    else:
-                        st.session_state.viewer_ok = True
-                        st.success("验证成功。")
+                    st.session_state.viewer_ok = True
+                    st.success("验证成功。")
 
         if st.session_state.viewer_ok and input_supplier:
-            supplier_df = df[df[transport_col].astype(str).str.strip() == input_supplier].copy()
-            st.write(f"当前共有 {len(supplier_df)} 条数据")
-            st.dataframe(supplier_df, use_container_width=True, hide_index=True)
+            date_options = [rec["source_date"] for rec in records]
+            date_labels = {d: normalize_date_display(d) for d in date_options}
 
-            date_prefix = extract_date_from_filename(meta.get("source_name", ""))
-            download_name = f"{date_prefix}_{safe_filename(input_supplier)}.xlsx"
-            excel_bytes = dataframe_to_excel_bytes(supplier_df)
-
-            st.download_button(
-                label="下载我的 Excel",
-                data=excel_bytes,
-                file_name=download_name,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            selected_date = st.selectbox(
+                "请选择日期",
+                options=date_options,
+                format_func=lambda x: date_labels.get(x, x)
             )
+
+            record = get_record_by_date(selected_date)
+            if record:
+                st.write(f"当前日期文件：{record.get('source_name', '未知文件')}")
+
+                try:
+                    df, transport_col = load_df_from_record(record)
+
+                    if df is None:
+                        st.error("该日期文件读取失败。")
+                    else:
+                        supplier_df = df[df[transport_col].astype(str).str.strip() == input_supplier].copy()
+
+                        if supplier_df.empty:
+                            st.warning("该日期下没有你的数据。")
+                        else:
+                            st.write(f"当前共有 {len(supplier_df)} 条数据")
+                            st.dataframe(supplier_df, use_container_width=True, hide_index=True)
+
+                            download_name = f"{selected_date}_{safe_filename(input_supplier)}.xlsx"
+                            excel_bytes = dataframe_to_excel_bytes(supplier_df)
+
+                            st.download_button(
+                                label="下载我的 Excel",
+                                data=excel_bytes,
+                                file_name=download_name,
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                            )
+                except Exception as e:
+                    st.error(f"读取数据失败：{e}")
