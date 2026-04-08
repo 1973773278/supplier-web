@@ -136,7 +136,7 @@ def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
 
 # ========= 页面标题 =========
 st.title("供应商数据下载网页")
-st.caption("管理员上传总表后，供应商可按姓名 + 密码查看并下载自己的数据。")
+st.caption("管理员上传总表后，供应商可按供应商名称 + 密码查看并下载自己的数据。")
 
 
 # ========= 侧边栏：说明 =========
@@ -144,8 +144,8 @@ with st.sidebar:
     st.header("使用说明")
     st.write("1. 管理员先上传当天总表")
     st.write("2. 给供应商设置密码")
-    st.write("3. 供应商选择自己的名字并输入密码")
-    st.write("4. 查看并下载自己的 Excel")
+    st.write("3. 供应商手动输入自己的供应商名称")
+    st.write("4. 输入密码后查看并下载自己的 Excel")
     st.info("如果你没配置 secrets.toml，管理员默认密码是：admin123")
 
 
@@ -237,7 +237,6 @@ with tab_supplier:
         st.write(f"当前总表：{meta.get('source_name', '未知文件')}")
         st.write(f"更新时间：{meta.get('upload_time', '未知时间')}")
 
-        suppliers = get_supplier_list(df, transport_col)
         passwords = load_passwords()
 
         if "viewer_ok" not in st.session_state:
@@ -245,35 +244,42 @@ with tab_supplier:
         if "viewer_supplier" not in st.session_state:
             st.session_state.viewer_supplier = ""
 
-        selected_supplier = st.selectbox("请选择你的供应商名称", suppliers)
-
-        # 如果切换了供应商，重置登录状态
-        if selected_supplier != st.session_state.viewer_supplier:
-            st.session_state.viewer_ok = False
-            st.session_state.viewer_supplier = selected_supplier
-
+        input_supplier = st.text_input("请输入你的供应商名称").strip()
         supplier_pwd_input = st.text_input("请输入密码", type="password", key="supplier_pwd_input")
 
-        if st.button("查看我的数据"):
-            real_pwd = passwords.get(selected_supplier, None)
+        if input_supplier != st.session_state.viewer_supplier:
+            st.session_state.viewer_ok = False
+            st.session_state.viewer_supplier = input_supplier
 
-            if real_pwd is None:
-                st.error("管理员还没有给这个供应商设置密码。")
-                st.session_state.viewer_ok = False
-            elif supplier_pwd_input != real_pwd:
-                st.error("密码错误。")
+        if st.button("查看我的数据"):
+            if not input_supplier:
+                st.error("请输入供应商名称。")
                 st.session_state.viewer_ok = False
             else:
-                st.session_state.viewer_ok = True
-                st.success("验证成功。")
+                real_pwd = passwords.get(input_supplier, None)
 
-        if st.session_state.viewer_ok:
-            supplier_df = df[df[transport_col].astype(str).str.strip() == selected_supplier].copy()
+                if real_pwd is None:
+                    st.error("供应商名称不存在，或管理员还没有为该供应商设置密码。")
+                    st.session_state.viewer_ok = False
+                elif supplier_pwd_input != real_pwd:
+                    st.error("密码错误。")
+                    st.session_state.viewer_ok = False
+                else:
+                    supplier_df = df[df[transport_col].astype(str).str.strip() == input_supplier].copy()
+                    if supplier_df.empty:
+                        st.error("当前总表中没有找到该供应商的数据。")
+                        st.session_state.viewer_ok = False
+                    else:
+                        st.session_state.viewer_ok = True
+                        st.success("验证成功。")
+
+        if st.session_state.viewer_ok and input_supplier:
+            supplier_df = df[df[transport_col].astype(str).str.strip() == input_supplier].copy()
             st.write(f"当前共有 {len(supplier_df)} 条数据")
             st.dataframe(supplier_df, use_container_width=True, hide_index=True)
 
             date_prefix = extract_date_from_filename(meta.get("source_name", ""))
-            download_name = f"{date_prefix}_{safe_filename(selected_supplier)}.xlsx"
+            download_name = f"{date_prefix}_{safe_filename(input_supplier)}.xlsx"
             excel_bytes = dataframe_to_excel_bytes(supplier_df)
 
             st.download_button(
